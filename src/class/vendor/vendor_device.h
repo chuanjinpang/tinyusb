@@ -38,6 +38,19 @@
  extern "C" {
 #endif
 
+#define USBLINK_MSG_MAX_SIZE (1728) //27*64
+
+
+typedef struct {
+	int id;
+	uint16_t cmd_flg;
+	size_t len;
+	uint8_t  payload[USBLINK_MSG_MAX_SIZE];
+	
+} urb_msg_t;
+
+size_t _tud_vendor_submit_tx_urb (uint8_t itf, urb_msg_t * msg);
+
 //--------------------------------------------------------------------+
 // Application API (Multiple Interfaces)
 //--------------------------------------------------------------------+
@@ -69,7 +82,7 @@ static inline uint32_t tud_vendor_write_available (void);
 //--------------------------------------------------------------------+
 
 // Invoked when received new data
-TU_ATTR_WEAK void tud_vendor_rx_cb(uint8_t itf);
+TU_ATTR_WEAK void tud_vendor_rx_cb(uint8_t itf,uint8_t * msg, int len);
 
 //--------------------------------------------------------------------+
 // Inline Functions
@@ -100,9 +113,11 @@ static inline bool tud_vendor_peek (int pos, uint8_t* u8)
   return tud_vendor_n_peek(0, pos, u8);
 }
 
-static inline uint32_t tud_vendor_write (void const* buffer, uint32_t bufsize)
+int tud_vendor_tx_queue_cnt(uint8_t itf);
+
+static inline uint32_t tud_vendor_submit_tx_urb (urb_msg_t * msg)
 {
-  return tud_vendor_n_write(0, buffer, bufsize);
+  return _tud_vendor_submit_tx_urb(0, msg);
 }
 
 static inline uint32_t tud_vendor_write_str (char const* str)
@@ -114,6 +129,9 @@ static inline uint32_t tud_vendor_write_available (void)
 {
   return tud_vendor_n_write_available(0);
 }
+
+
+void vendord_reset_txfifo(uint8_t rhport);
 
 //--------------------------------------------------------------------+
 // Internal Class Driver API
