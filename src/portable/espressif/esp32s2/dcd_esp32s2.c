@@ -291,7 +291,7 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc_edpt)
     TU_ASSERT(fifo_num != 0);
 
     in_ep[epnum].diepctl &= ~(USB_D_TXFNUM1_M | USB_D_EPTYPE1_M | USB_DI_SETD0PID1 | USB_D_MPS1_M);
-    in_ep[epnum].diepctl |= USB_D_USBACTEP1_M |
+    in_ep[epnum].diepctl |= USB_D_USBACTEP1_M |USB_DI_SNAK1_M|
                             fifo_num << USB_D_TXFNUM1_S |
                             desc_edpt->bmAttributes.xfer << USB_D_EPTYPE1_S |
                             (desc_edpt->bmAttributes.xfer != TUSB_XFER_ISOCHRONOUS ? (1 << USB_DI_SETD0PID1_S) : 0) |
@@ -340,15 +340,50 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
   // here.
   if (dir == TUSB_DIR_IN) {
     // A full IN transfer (multiple packets, possibly) triggers XFRC.
-    USB0.in_ep_reg[epnum].dieptsiz = (num_packets << USB_D_PKTCNT0_S) | total_bytes;
-    USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA1_M | USB_D_CNAK1_M; // Enable | CNAK
 
+	if(0!=epnum  && USB0.in_ep_reg[epnum].diepctl & USB_D_EPENA1_M)
+		{
+
+		MY_IN_ERROR_EARLY_LOGI("tu", "##############error--try to write epsize when transfer bug");
+
+		}
+    //USB0.in_ep_reg[epnum].dieptsiz = (num_packets << USB_D_PKTCNT0_S) | total_bytes;
+    xfer->tx_fsm=0;
+    USB0.in_ep_reg[epnum].dieptsiz = (1 << USB_D_PKTCNT0_S) | (total_bytes> xfer->max_size? xfer->max_size:short_packet_size);
+
+  	
+	 	//if(0!=epnum && get_dbg_flg())
+		{
+		MY_IN_DBG_EARLY_LOGI("tu","IN%d start%d siz%x\n",epnum,xfer->total_len,USB0.in_ep_reg[epnum].dieptsiz);
+		}
+		xfer->start_us=get_system_us();
+	if(0==epnum)
+		 USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA1_M | USB_D_CNAK1_M; // Enable | CNAK
+	else {
+		
+		//MY_IN_DBG_EARLY_LOGI("tu", "IN%d irq%x xfs:%x ctl%x siz%x\n",epnum,USB0.in_ep_reg[epnum].diepint,USB0.in_ep_reg[epnum].dtxfsts,USB0.in_ep_reg[epnum].diepctl,USB0.in_ep_reg[epnum].dieptsiz);
+		//transmit_packet(xfer, &USB0.in_ep_reg[epnum], epnum);
+		//USB0.in_ep_reg[epnum].dieptsiz = (num_packets << USB_D_PKTCNT0_S) | total_bytes;
+		
+		USB0.in_ep_reg[epnum].diepctl |=  USB_DI_SNAK1_M; // set NAK 
+		USB0.in_ep_reg[epnum].diepint = USB_D_INTKNTXFEMP0;
+		USB0.in_ep_reg[epnum].diepint = USB_D_NAKINTRPT0_M;
+		xfer->tx_fsm=1;	
+	     xfer->nak_cnt=0;
+		//esp_rom_delay_us(50);
+		USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA1_M |USB_D_CNAK1_M; // Enable 
+		}
     // Enable fifo empty interrupt only if there are something to put in the fifo.
     if(total_bytes != 0) {
       USB0.dtknqr4_fifoemptymsk |= (1 << epnum);
     }
   } else {
     // Each complete packet for OUT xfers triggers XFRC.
+    //first should clean size
+    if(0 == xfer->queued_len){
+		xfer->rx_start_us=get_system_us();
+    	}
+    USB0.out_ep_reg[epnum].doeptsiz &=~USB_XFERSIZE0_M;
     USB0.out_ep_reg[epnum].doeptsiz |= USB_PKTCNT0_M | ((xfer->max_size & USB_XFERSIZE0_V) << USB_XFERSIZE0_S);
     USB0.out_ep_reg[epnum].doepctl  |= USB_EPENA0_M | USB_CNAK0_M;
   }
@@ -420,14 +455,23 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
   uint8_t const dir = tu_edpt_dir(ep_addr);
 
   if (dir == TUSB_DIR_IN) {
-    in_ep[epnum].diepctl &= ~USB_D_STALL1_M;
-
+   
+#if 1
     uint8_t eptype = (in_ep[epnum].diepctl & USB_D_EPTYPE1_M) >> USB_D_EPTYPE1_S;
     // Required by USB spec to reset DATA toggle bit to DATA0 on interrupt
     // and bulk endpoints.
+	in_ep[epnum].diepctl |= 3<<USB_D_EPTYPE1_S;
+	
+	MY_IN_DBG_EARLY_LOGI("tu", "%s	%x ctl:%x\n",__FUNCTION__,ep_addr,in_ep[epnum].diepctl);
+	in_ep[epnum].diepctl =(in_ep[epnum].diepctl & (~USB_D_EPTYPE1_M)) | (eptype<<USB_D_EPTYPE1_S);
+	//try to change type may reset something.
+	MY_IN_DBG_EARLY_LOGI("tu", "%s	%x B ctl:%x\n",__FUNCTION__,ep_addr,in_ep[epnum].diepctl);
     if (eptype == 2 || eptype == 3) {
       in_ep[epnum].diepctl |= USB_DI_SETD0PID1_M;
     }
+
+	 in_ep[epnum].diepctl &= ~USB_D_STALL1_M;
+#endif
   } else {
     out_ep[epnum].doepctl &= ~USB_STALL1_M;
 
@@ -442,7 +486,7 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
 
 /*------------------------------------------------------------------*/
 
-static void receive_packet(xfer_ctl_t *xfer, /* usb_out_endpoint_t * out_ep, */ uint16_t xfer_size)
+static void IRAM_ATTR receive_packet(uint8_t epnum,xfer_ctl_t *xfer, /* usb_out_endpoint_t * out_ep, */ uint16_t xfer_size)
 {
   ESP_EARLY_LOGV(TAG, "USB - receive_packet");
   volatile uint32_t *rx_fifo = USB0.fifo[0];
@@ -468,6 +512,23 @@ static void receive_packet(xfer_ctl_t *xfer, /* usb_out_endpoint_t * out_ep, */ 
 
   // Do not assume xfer buffer is aligned.
   uint8_t *base = (xfer->buffer + xfer->queued_len);
+
+
+if(0!=epnum){
+
+	MY_OUT_EARLY_LOGI("tu", "OUT%d rcv%d %d int%x ctl%x %x\n",epnum,xfer_size, xfer->queued_len,USB0.out_ep_reg[epnum].doepint,USB0.out_ep_reg[epnum].doepctl,USB0.out_ep_reg[epnum].doeptsiz);
+}
+
+  if(xfer_size>64){
+	  MY_OUT_ERROR_EARLY_LOGI("tu", "xsize OUT%d rcv may ovf:%d %d (%d xfer:%d)--------bug\n",epnum,xfer->queued_len,xfer->total_len ,to_recv_size,xfer_size);
+  
+	  }
+
+  if(to_recv_size + xfer->queued_len > xfer->total_len){
+
+	MY_OUT_ERROR_EARLY_LOGI("tu", "OUT%d rcv may ovf:%d %d (%d xfer:%d)--------bug\n",epnum,xfer->queued_len,xfer->total_len ,to_recv_size,xfer_size);
+	goto out;
+  	}
 
   // This for loop always runs at least once- skip if less than 4 bytes
   // to collect.
@@ -500,23 +561,65 @@ static void receive_packet(xfer_ctl_t *xfer, /* usb_out_endpoint_t * out_ep, */ 
   // Per USB spec, a short OUT packet (including length 0) is always
   // indicative of the end of a transfer (at least for ctl, bulk, int).
   xfer->short_packet = (xfer_size < xfer->max_size);
+  out:
+  if(epnum!=0) {
+	  xfer->transfer_done=1;
+	  xfer->ticks=myGetTickCount();
+  	}
+  
 }
 
-static void transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep, uint8_t fifo_num)
+static IRAM_ATTR int transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep, uint8_t fifo_num)
 {
   ESP_EARLY_LOGV(TAG, "USB - transmit_packet");
   volatile uint32_t *tx_fifo = USB0.fifo[fifo_num];
+#define CFG_TUD_ESP_TX_SIZE (64*3) 
 
   uint16_t remaining = (in_ep->dieptsiz & 0x7FFFFU) >> USB_D_XFERSIZE0_S;
-  xfer->queued_len = xfer->total_len - remaining;
+
+  if(1 != xfer->tx_fsm  && 0!=fifo_num){
+	  MY_IN_ERROR_EARLY_LOGI("tu", "###bug fsm IN%d r%d %d %d\n",fifo_num, remaining,xfer->queued_len,xfer->total_len);
+    
+  }
+  	  
+
+#if 0
+  if(0==fifo_num) {
+  	xfer->queued_len = xfer->total_len - remaining;
+  }
+ #endif 
+#if 0
+  uint16_t to_xfer_size =0;
+ if(0!=fifo_num){
+	to_xfer_size=((remaining-xfer->queued_len) > xfer->max_size) ? xfer->max_size: (remaining-xfer->queued_len);
+	
+ }
+ else{
+
+	to_xfer_size = (remaining > xfer->max_size) ? xfer->max_size : remaining;
+
+ 	}
+#else
 
   uint16_t to_xfer_size = (remaining > xfer->max_size) ? xfer->max_size : remaining;
+
+ 
+#endif
   uint8_t to_xfer_rem = to_xfer_size % 4;
   uint16_t to_xfer_size_aligned = to_xfer_size - to_xfer_rem;
 
+#if 0
+  if(0!=fifo_num){
+  	if(to_xfer_size==xfer->max_size)
+		to_xfer_size-=4;//ok we just test it
+  	}
+#endif
   // Buffer might not be aligned to 32b, so we need to force alignment
   // by copying to a temp var.
   uint8_t *base = (xfer->buffer + xfer->queued_len);
+  	{
+	 xfer->queued_len+=to_xfer_size;
+  }
 
   // This for loop always runs at least once- skip if less than 4 bytes
   // to send off.
@@ -543,9 +646,10 @@ static void transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep,
 
     (*tx_fifo) = tmp;
   }
+  return to_xfer_size;
 }
 
-static void read_rx_fifo(void)
+static void IRAM_ATTR read_rx_fifo(void)
 {
   // Pop control word off FIFO (completed xfers will have 2 control words,
   // we only pop one ctl word each interrupt).
@@ -562,7 +666,11 @@ static void read_rx_fifo(void)
     case 0x02: { // Out packet recvd
       ESP_EARLY_LOGV(TAG, "TUSB IRQ - RX type : Out packet");
       xfer_ctl_t *xfer = XFER_CTL_BASE(epnum, TUSB_DIR_OUT);
-      receive_packet(xfer, bcnt);
+		if(epnum>3){
+			ESP_EARLY_LOGI(TAG, "OUT%d is error bug-------",epnum);
+			break;
+		}
+		receive_packet(epnum,xfer, bcnt);
     }
     break;
 
@@ -594,7 +702,9 @@ static void read_rx_fifo(void)
   }
 }
 
-static void handle_epout_ints(void)
+
+
+static void IRAM_ATTR handle_epout_ints(void)
 {
   // GINTSTS will be cleared with DAINT == 0
   // DAINT for a given EP clears when DOEPINTx is cleared.
@@ -602,7 +712,7 @@ static void handle_epout_ints(void)
   for (int n = 0; n < USB_OUT_EP_NUM; n++) {
     xfer_ctl_t *xfer = XFER_CTL_BASE(n, TUSB_DIR_OUT);
 
-    if (USB0.daint & (1 << (16 + n))) {
+    if (USB0.daint & (1 << (16 + n)) || (xfer->transfer_done)) {
       // SETUP packet Setup Phase done.
       if ((USB0.out_ep_reg[n].doepint & USB_SETUP0_M)) {
         USB0.out_ep_reg[n].doepint = USB_STUPPKTRCVD0_M | USB_SETUP0_M; // clear
@@ -611,25 +721,35 @@ static void handle_epout_ints(void)
 
       // OUT XFER complete (single packet).q
       if (USB0.out_ep_reg[n].doepint & USB_XFERCOMPL0_M) {
-
+	  	retry:
+	  
         ESP_EARLY_LOGV(TAG, "TUSB IRQ - EP OUT - XFER complete (single packet)");
         USB0.out_ep_reg[n].doepint = USB_XFERCOMPL0_M;
+		xfer->transfer_done=0;
 
         // Transfer complete if short packet or total len is transferred
-        if (xfer->short_packet || (xfer->queued_len == xfer->total_len)) {
+        if (xfer->short_packet || (xfer->queued_len >= xfer->total_len)) {
           xfer->short_packet = false;
           dcd_event_xfer_complete(0, n, xfer->queued_len, XFER_RESULT_SUCCESS, true);
         } else {
           // Schedule another packet to be received.
+          USB0.out_ep_reg[n].doeptsiz &=~USB_XFERSIZE0_M;
           USB0.out_ep_reg[n].doeptsiz |= USB_PKTCNT0_M | ((xfer->max_size & USB_XFERSIZE0_V) << USB_XFERSIZE0_S);
           USB0.out_ep_reg[n].doepctl |= USB_EPENA0_M | USB_CNAK0_M;
         }
       }
+	  if(xfer->transfer_done){
+	  	TickType_t diff=myGetTickCount()-xfer->ticks;
+		if( diff>50){//50ms timeout, we lost interrupt
+		
+			goto retry;
+			}
+	  	}
     }
   }
 }
 
-static void handle_epin_ints(void)
+static void IRAM_ATTR handle_epin_ints(void)
 {
   // GINTSTS will be cleared with DAINT == 0
   // DAINT for a given EP clears when DIEPINTx is cleared.
@@ -643,15 +763,53 @@ static void handle_epin_ints(void)
       if (USB0.in_ep_reg[n].diepint & USB_D_XFERCOMPL0_M) {
         ESP_EARLY_LOGV(TAG, "TUSB IRQ - IN XFER complete!");
         USB0.in_ep_reg[n].diepint = USB_D_XFERCOMPL0_M;
-        dcd_event_xfer_complete(0, n | TUSB_DIR_IN_MASK, xfer->total_len, XFER_RESULT_SUCCESS, true);
+	   USB0.in_ep_reg[n].dieptsiz =  0;
+	   
+			if((xfer->queued_len >= xfer->total_len)){
+				long diff=get_system_us()- xfer->start_us;
+				long spd=(xfer->total_len*1000)/diff;
+				tx_speed=spd;
+				#if 1
+				 MY_IN_DBG_EARLY_LOGI("tu", "#IN%d xfer cpl irq%x xfs:%x ctl%x siz%x t:%d spd%d\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz,diff,spd);
+		  		#else
+				ESP_EARLY_LOGI("tu", "#IN%d xfer cpl irq%x xfs:%x ctl%x siz%x t:%d spd%d\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz,diff,spd);
+				#endif
+				xfer->tx_fsm=2;	
+				xfer->nak_cnt=0;
+        		dcd_event_xfer_complete(0, n | TUSB_DIR_IN_MASK, xfer->total_len, XFER_RESULT_SUCCESS, true);
+			}
+			else {
+				uint16_t remain = xfer->total_len -xfer->queued_len;
+				xfer->tx_fsm=0;	
+				xfer->nak_cnt=0;
+				USB0.in_ep_reg[n].dieptsiz = (1 << USB_D_PKTCNT0_S) | (remain> xfer->max_size? xfer->max_size:remain);
+				xfer->tx_fsm=1;	
+				USB0.in_ep_reg[n].diepint = USB_D_INTKNTXFEMP0;
+				USB0.in_ep_reg[n].diepint = USB_D_NAKINTRPT0_M;
+				//esp_rom_delay_us(5);
+				USB0.in_ep_reg[n].diepctl |= USB_D_EPENA1_M |USB_D_CNAK1_M; // Enable 
+				USB0.dtknqr4_fifoemptymsk |= (1 << n);
+			
+				}
       }
 
       // XFER FIFO empty
       if (USB0.in_ep_reg[n].diepint & USB_D_TXFEMP0_M) {
+	  	int tx_n=0;
         ESP_EARLY_LOGV(TAG, "TUSB IRQ - IN XFER FIFO empty!");
+		 if(0 != n) {
+      // MY_IN_DBG_EARLY_LOGI("tu", "IN%d irq%x %x\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts);
+	   //MY_IN_DBG_EARLY_LOGI("tu", "IN%d ctl%x %x\n",n,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz);
+      	}
         USB0.in_ep_reg[n].diepint = USB_D_TXFEMP0_M;
-        transmit_packet(xfer, &USB0.in_ep_reg[n], n);
+		if( 0==n) 
+		{
 
+
+			//wait for IN token
+		 	tx_n=transmit_packet(xfer, &USB0.in_ep_reg[n], n);
+			
+		}
         // Turn off TXFE if all bytes are written.
         if (xfer->queued_len == xfer->total_len)
         {
@@ -659,6 +817,19 @@ static void handle_epin_ints(void)
         }
       }
 
+#if 1
+
+	 // if (USB0.in_ep_reg[n].diepint & USB_D_INTKNTXFEMP0 && (USB0.in_ep_reg[n].diepint & USB_D_NAKINTRPT0_M)) {
+	  if (USB0.in_ep_reg[n].diepint & USB_D_INTKNTXFEMP0 && (USB0.in_ep_reg[n].diepint & USB_D_NAKINTRPT0_M)) {
+		USB0.in_ep_reg[n].diepint = USB_D_INTKNTXFEMP0|USB_D_NAKINTRPT0_M;
+		 xfer->nak_cnt++;
+		if(USB0.in_ep_reg[n].diepctl & USB_D_EPENA1_M && 0!=n &&  xfer->nak_cnt >=g_nak_thd){
+				transmit_packet(xfer, &USB0.in_ep_reg[n], n);
+				USB0.dtknqr4_fifoemptymsk &= ~(1 << n);
+				  MY_IN_DBG_EARLY_LOGI("tu", "IN%d wt fifo irq%x xfs%x ctl%x siz%x\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz);
+			}
+	  	}
+#endif
       // XFER Timeout
       if (USB0.in_ep_reg[n].diepint & USB_D_TIMEOUT0_M) {
         // Clear interrupt or enpoint will hang.
@@ -670,7 +841,7 @@ static void handle_epin_ints(void)
 }
 
 
-static void _dcd_int_handler(void* arg)
+static void IRAM_ATTR _dcd_int_handler(void* arg)
 {
   (void) arg;
   uint8_t const rhport = 0;
@@ -747,7 +918,7 @@ static void _dcd_int_handler(void* arg)
   }
 
   // OUT endpoint interrupt handling.
-  if (int_status & USB_OEPINT_M) {
+  if ((int_status & USB_OEPINT_M)||int_status & USB_IEPINT_M) {
     // OEPINT is read-only
     ESP_EARLY_LOGV(TAG, "dcd_int_handler - OUT endpoint!");
     handle_epout_ints();

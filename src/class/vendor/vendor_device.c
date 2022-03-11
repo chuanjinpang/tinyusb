@@ -30,7 +30,19 @@
 
 #include "vendor_device.h"
 #include "device/usbd_pvt.h"
+#include "device/dcd.h"
 
+#include "esp_log.h"
+
+#define CFG_TUD_VENDOR_RX_BUFSIZE (1728)
+#define CFG_TUD_VENDOR_TX_BUFSIZE (1728)  //send to host
+
+//#define CFG_TUD_VENDOR_TX_BUFSIZE (64)  //send to host
+#define XFZ_URB_LIST_MAX_SIZE 2
+#define XFZ_URB_RX_LIST_MAX_SIZE 2
+
+
+#define TAG  "vu"
 //--------------------------------------------------------------------+
 // MACRO CONSTANT TYPEDEF
 //--------------------------------------------------------------------+
@@ -43,7 +55,6 @@ typedef struct
   /*------------- From this point, data is not cleared by bus reset -------------*/
   tu_fifo_t rx_ff;
   tu_fifo_t tx_ff;
-
   uint8_t rx_ff_buf[CFG_TUD_VENDOR_RX_BUFSIZE];
   uint8_t tx_ff_buf[CFG_TUD_VENDOR_TX_BUFSIZE];
 
@@ -52,9 +63,16 @@ typedef struct
   osal_mutex_def_t tx_ff_mutex;
 #endif
 
+
+  QueueHandle_t urb_list;
+  QueueHandle_t urb_rx_list;
+
+  urb_msg_t cur_urb;
+  urb_msg_t cur_rx_urb;
+
   // Endpoint Transfer buffer
-  CFG_TUSB_MEM_ALIGN uint8_t epout_buf[CFG_TUD_VENDOR_EPSIZE];
-  CFG_TUSB_MEM_ALIGN uint8_t epin_buf[CFG_TUD_VENDOR_EPSIZE];
+  CFG_TUSB_MEM_ALIGN uint8_t epout_buf[CFG_TUD_VENDOR_RX_BUFSIZE];
+  CFG_TUSB_MEM_ALIGN uint8_t epin_buf[CFG_TUD_VENDOR_TX_BUFSIZE];
 } vendord_interface_t;
 
 CFG_TUSB_MEM_SECTION static vendord_interface_t _vendord_itf[CFG_TUD_VENDOR];
@@ -82,15 +100,28 @@ bool tud_vendor_n_peek(uint8_t itf, int pos, uint8_t* u8)
 //--------------------------------------------------------------------+
 static void _prep_out_transaction (vendord_interface_t* p_itf)
 {
+
   // skip if previous transfer not complete
   if ( usbd_edpt_busy(TUD_OPT_RHPORT, p_itf->ep_out) ) return;
 
+#if 0
+#define CFG_TUD_ESP_RX_SIZE (64*27)
+
   // Prepare for incoming data but only allow what we can store in the ring buffer.
   uint16_t max_read = tu_fifo_remaining(&p_itf->rx_ff);
-  if ( max_read >= CFG_TUD_VENDOR_EPSIZE )
+  if ( max_read >= CFG_TUD_ESP_RX_SIZE )
   {
-    usbd_edpt_xfer(TUD_OPT_RHPORT, p_itf->ep_out, p_itf->epout_buf, CFG_TUD_VENDOR_EPSIZE);
+    usbd_edpt_xfer(TUD_OPT_RHPORT, p_itf->ep_out, p_itf->epout_buf, CFG_TUD_ESP_RX_SIZE);
   }
+  else {
+	ESP_EARLY_LOGI("tu", "no space for start OUT xfer\n");	
+
+  	}
+#else
+	TU_ASSERT( usbd_edpt_xfer(TUD_OPT_RHPORT, p_itf->ep_out, p_itf->epout_buf, CFG_TUD_VENDOR_RX_BUFSIZE) );
+
+
+ #endif
 }
 
 uint32_t tud_vendor_n_read (uint8_t itf, void* buffer, uint32_t bufsize)
@@ -106,23 +137,71 @@ uint32_t tud_vendor_n_read (uint8_t itf, void* buffer, uint32_t bufsize)
 //--------------------------------------------------------------------+
 static bool maybe_transmit(vendord_interface_t* p_itf)
 {
+#define CFG_TUD_ESP_TX_SIZE (CFG_TUD_VENDOR_RX_BUFSIZE) 
+
   // skip if previous transfer not complete
   TU_VERIFY( !usbd_edpt_busy(TUD_OPT_RHPORT, p_itf->ep_in) );
-
-  uint16_t count = tu_fifo_read_n(&p_itf->tx_ff, p_itf->epin_buf, CFG_TUD_VENDOR_EPSIZE);
-  if (count > 0)
+uint16_t len=0;
+ // Claim the endpoint
+#if 0
+if(0== usbd_edpt_claim(TUD_OPT_RHPORT, p_itf->ep_in) )
   {
-    TU_ASSERT( usbd_edpt_xfer(TUD_OPT_RHPORT, p_itf->ep_in, p_itf->epin_buf, count) );
+	ESP_EARLY_LOGI("tu","tiny usb claim NG\n");
+	return 0;
   }
+
+#endif
+
+  if (pdTRUE==xQueueReceive(p_itf->urb_list, &p_itf->cur_urb, 0)){
+  		if(p_itf->cur_urb.len>USBLINK_MSG_MAX_SIZE){
+			ESP_EARLY_LOGI("tu","urb len over size %d\n",p_itf->cur_urb.len);
+			return true;
+  			}
+			if(0 == p_itf->cur_urb.len){
+			ESP_EARLY_LOGI("tu","urb len is 0 %d\n",p_itf->cur_urb.len);
+			return true;
+  			}
+		 memcpy(p_itf->epin_buf,p_itf->cur_urb.payload,p_itf->cur_urb.len);	
+
+		TU_ASSERT( usbd_edpt_xfer(TUD_OPT_RHPORT, p_itf->ep_in, p_itf->epin_buf, p_itf->cur_urb.len) );
+
+ } 
+
   return true;
 }
 
-uint32_t tud_vendor_n_write (uint8_t itf, void const* buffer, uint32_t bufsize)
+bool tud_vendor_n_write_empty(uint8_t itf)
 {
+  return tu_fifo_empty(&_vendord_itf[itf].tx_ff);
+}
+
+
+size_t _tud_vendor_submit_tx_urb (uint8_t itf, urb_msg_t * msg)
+{
+  uint16_t ret=0;
+
   vendord_interface_t* p_itf = &_vendord_itf[itf];
-  uint16_t ret = tu_fifo_write_n(&p_itf->tx_ff, buffer, bufsize);
+
+  if(pdTRUE!= xQueueSend(p_itf->urb_list, msg, (80) / portTICK_RATE_MS))
+    {
+		  ret=0;
+		  goto out;
+	}
+ 
   maybe_transmit(p_itf);
+  
+   ret=msg->len;
+   out:
+
   return ret;
+}
+
+int tud_vendor_tx_queue_cnt(uint8_t itf){
+	vendord_interface_t* p_itf = &_vendord_itf[itf];
+
+
+return	uxQueueMessagesWaiting(p_itf->urb_list);
+
 }
 
 uint32_t tud_vendor_n_write_available (uint8_t itf)
@@ -145,6 +224,10 @@ void vendord_init(void)
     tu_fifo_config(&p_itf->rx_ff, p_itf->rx_ff_buf, CFG_TUD_VENDOR_RX_BUFSIZE, 1, false);
     tu_fifo_config(&p_itf->tx_ff, p_itf->tx_ff_buf, CFG_TUD_VENDOR_TX_BUFSIZE, 1, false);
 
+
+	p_itf->urb_list = xQueueCreate(XFZ_URB_LIST_MAX_SIZE, sizeof(urb_msg_t));
+	p_itf->urb_rx_list = xQueueCreate(XFZ_URB_RX_LIST_MAX_SIZE, sizeof(urb_msg_t));
+
 #if CFG_FIFO_MUTEX
     tu_fifo_config_mutex(&p_itf->rx_ff, osal_mutex_create(&p_itf->rx_ff_mutex));
     tu_fifo_config_mutex(&p_itf->tx_ff, osal_mutex_create(&p_itf->tx_ff_mutex));
@@ -164,6 +247,26 @@ void vendord_reset(uint8_t rhport)
     tu_fifo_clear(&p_itf->rx_ff);
     tu_fifo_clear(&p_itf->tx_ff);
   }
+}
+
+void vendord_reset_txfifo(uint8_t rhport)
+{
+  (void) rhport;
+
+  for(uint8_t i=0; i<CFG_TUD_VENDOR; i++)
+  {
+    vendord_interface_t* p_itf = &_vendord_itf[i];
+    tu_fifo_clear(&p_itf->tx_ff);
+	 dcd_event_xfer_complete(0, 3 | TUSB_DIR_IN_MASK, 64, XFER_RESULT_SUCCESS, true);
+  }
+
+  //usbd_edpt_stall(rhport, 3 | TUSB_DIR_IN_MASK);
+}
+
+bool vendord_stalled(void){
+
+return 	usbd_edpt_stalled(0, 3 | TUSB_DIR_IN_MASK);
+
 }
 
 uint16_t vendord_open(uint8_t rhport, tusb_desc_interface_t const * itf_desc, uint16_t max_len)
@@ -218,10 +321,10 @@ bool vendord_xfer_cb(uint8_t rhport, uint8_t ep_addr, xfer_result_t result, uint
   if ( ep_addr == p_itf->ep_out )
   {
     // Receive new data
-    tu_fifo_write_n(&p_itf->rx_ff, p_itf->epout_buf, xferred_bytes);
+ 
 
     // Invoked callback if any
-    if (tud_vendor_rx_cb) tud_vendor_rx_cb(itf);
+    if (tud_vendor_rx_cb) tud_vendor_rx_cb(itf,p_itf->epout_buf, xferred_bytes);
 
     _prep_out_transaction(p_itf);
   }

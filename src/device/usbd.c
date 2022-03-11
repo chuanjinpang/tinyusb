@@ -562,6 +562,10 @@ static bool invoke_class_control(uint8_t rhport, usbd_class_driver_t const * dri
 {
   usbd_control_set_complete_callback(driver->control_xfer_cb);
   TU_LOG2("  %s control request\r\n", driver->name);
+  if(!driver->control_xfer_cb) {
+  
+  	return true;
+  	}
   return driver->control_xfer_cb(rhport, CONTROL_STAGE_SETUP, request);
 }
 
@@ -978,7 +982,7 @@ static bool process_get_descriptor(uint8_t rhport, tusb_control_request_t const 
 //--------------------------------------------------------------------+
 // DCD Event Handler
 //--------------------------------------------------------------------+
-void dcd_event_handler(dcd_event_t const * event, bool in_isr)
+void IRAM_ATTR dcd_event_handler(dcd_event_t const * event, bool in_isr)
 {
   switch (event->event_id)
   {
@@ -1041,7 +1045,7 @@ void dcd_event_setup_received(uint8_t rhport, uint8_t const * setup, bool in_isr
   dcd_event_handler(&event, in_isr);
 }
 
-void dcd_event_xfer_complete (uint8_t rhport, uint8_t ep_addr, uint32_t xferred_bytes, uint8_t result, bool in_isr)
+void IRAM_ATTR dcd_event_xfer_complete (uint8_t rhport, uint8_t ep_addr, uint32_t xferred_bytes, uint8_t result, bool in_isr)
 {
   dcd_event_t event = { .rhport = rhport, .event_id = DCD_EVENT_XFER_COMPLETE };
 
@@ -1117,7 +1121,8 @@ bool usbd_edpt_claim(uint8_t rhport, uint8_t ep_addr)
   // pre-check to help reducing mutex lock
   TU_VERIFY((_usbd_dev.ep_status[epnum][dir].busy == 0) && (_usbd_dev.ep_status[epnum][dir].claimed == 0));
 
-  osal_mutex_lock(_usbd_mutex, OSAL_TIMEOUT_WAIT_FOREVER);
+ // osal_mutex_lock(_usbd_mutex, OSAL_TIMEOUT_WAIT_FOREVER);
+  osal_mutex_lock(_usbd_mutex, 100);
 #endif
 
   // can only claim the endpoint if it is not busy and not claimed yet.
