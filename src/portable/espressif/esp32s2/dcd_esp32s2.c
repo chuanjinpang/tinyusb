@@ -57,12 +57,25 @@
 // Max number of IN EP FIFOs
 #define EP_FIFO_NUM 5
 
+#define TickType_t uint32_t
+int64_t esp_timer_get_time(void);
+
+TickType_t myGetTickCount( void ){
+return esp_timer_get_time()/1000;
+}
+
 typedef struct {
     uint8_t *buffer;
     uint16_t total_len;
     uint16_t queued_len;
     uint16_t max_size;
     bool short_packet;
+	int transfer_done;
+	TickType_t ticks;
+	long  start_us;
+	long  rx_start_us;
+	int tx_fsm;
+	int nak_cnt;
 } xfer_ctl_t;
 
 static const char *TAG = "TUSB:DCD";
@@ -310,6 +323,15 @@ bool dcd_edpt_open(uint8_t rhport, tusb_desc_endpoint_t const *desc_edpt)
   }
   return true;
 }
+static int transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_t *in_ep, uint8_t fifo_num);
+
+
+int64_t esp_timer_get_time(void);
+
+static long get_system_us(void)
+{
+    return esp_timer_get_time();
+}
 
 bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t total_bytes)
 {
@@ -344,7 +366,7 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
 	if(0!=epnum  && USB0.in_ep_reg[epnum].diepctl & USB_D_EPENA1_M)
 		{
 
-		MY_IN_ERROR_EARLY_LOGI("tu", "##############error--try to write epsize when transfer bug");
+		ESP_EARLY_LOGI("tu", "##############error--try to write epsize when transfer bug");
 
 		}
     //USB0.in_ep_reg[epnum].dieptsiz = (num_packets << USB_D_PKTCNT0_S) | total_bytes;
@@ -354,14 +376,14 @@ bool dcd_edpt_xfer(uint8_t rhport, uint8_t ep_addr, uint8_t *buffer, uint16_t to
   	
 	 	//if(0!=epnum && get_dbg_flg())
 		{
-		MY_IN_DBG_EARLY_LOGI("tu","IN%d start%d siz%x\n",epnum,xfer->total_len,USB0.in_ep_reg[epnum].dieptsiz);
+		ESP_EARLY_LOGI("tu","IN%d start%d siz%x\n",epnum,xfer->total_len,USB0.in_ep_reg[epnum].dieptsiz);
 		}
 		xfer->start_us=get_system_us();
 	if(0==epnum)
 		 USB0.in_ep_reg[epnum].diepctl |= USB_D_EPENA1_M | USB_D_CNAK1_M; // Enable | CNAK
 	else {
 		
-		//MY_IN_DBG_EARLY_LOGI("tu", "IN%d irq%x xfs:%x ctl%x siz%x\n",epnum,USB0.in_ep_reg[epnum].diepint,USB0.in_ep_reg[epnum].dtxfsts,USB0.in_ep_reg[epnum].diepctl,USB0.in_ep_reg[epnum].dieptsiz);
+		//ESP_EARLY_LOGI("tu", "IN%d irq%x xfs:%x ctl%x siz%x\n",epnum,USB0.in_ep_reg[epnum].diepint,USB0.in_ep_reg[epnum].dtxfsts,USB0.in_ep_reg[epnum].diepctl,USB0.in_ep_reg[epnum].dieptsiz);
 		//transmit_packet(xfer, &USB0.in_ep_reg[epnum], epnum);
 		//USB0.in_ep_reg[epnum].dieptsiz = (num_packets << USB_D_PKTCNT0_S) | total_bytes;
 		
@@ -462,10 +484,10 @@ void dcd_edpt_clear_stall(uint8_t rhport, uint8_t ep_addr)
     // and bulk endpoints.
 	in_ep[epnum].diepctl |= 3<<USB_D_EPTYPE1_S;
 	
-	MY_IN_DBG_EARLY_LOGI("tu", "%s	%x ctl:%x\n",__FUNCTION__,ep_addr,in_ep[epnum].diepctl);
+	ESP_EARLY_LOGI("tu", "%s	%x ctl:%x\n",__FUNCTION__,ep_addr,in_ep[epnum].diepctl);
 	in_ep[epnum].diepctl =(in_ep[epnum].diepctl & (~USB_D_EPTYPE1_M)) | (eptype<<USB_D_EPTYPE1_S);
 	//try to change type may reset something.
-	MY_IN_DBG_EARLY_LOGI("tu", "%s	%x B ctl:%x\n",__FUNCTION__,ep_addr,in_ep[epnum].diepctl);
+	ESP_EARLY_LOGI("tu", "%s	%x B ctl:%x\n",__FUNCTION__,ep_addr,in_ep[epnum].diepctl);
     if (eptype == 2 || eptype == 3) {
       in_ep[epnum].diepctl |= USB_DI_SETD0PID1_M;
     }
@@ -516,17 +538,17 @@ static void IRAM_ATTR receive_packet(uint8_t epnum,xfer_ctl_t *xfer, /* usb_out_
 
 if(0!=epnum){
 
-	MY_OUT_EARLY_LOGI("tu", "OUT%d rcv%d %d int%x ctl%x %x\n",epnum,xfer_size, xfer->queued_len,USB0.out_ep_reg[epnum].doepint,USB0.out_ep_reg[epnum].doepctl,USB0.out_ep_reg[epnum].doeptsiz);
+	ESP_EARLY_LOGI("tu", "OUT%d rcv%d %d int%x ctl%x %x\n",epnum,xfer_size, xfer->queued_len,USB0.out_ep_reg[epnum].doepint,USB0.out_ep_reg[epnum].doepctl,USB0.out_ep_reg[epnum].doeptsiz);
 }
 
   if(xfer_size>64){
-	  MY_OUT_ERROR_EARLY_LOGI("tu", "xsize OUT%d rcv may ovf:%d %d (%d xfer:%d)--------bug\n",epnum,xfer->queued_len,xfer->total_len ,to_recv_size,xfer_size);
+	  ESP_EARLY_LOGI("tu", "xsize OUT%d rcv may ovf:%d %d (%d xfer:%d)--------bug\n",epnum,xfer->queued_len,xfer->total_len ,to_recv_size,xfer_size);
   
 	  }
 
   if(to_recv_size + xfer->queued_len > xfer->total_len){
 
-	MY_OUT_ERROR_EARLY_LOGI("tu", "OUT%d rcv may ovf:%d %d (%d xfer:%d)--------bug\n",epnum,xfer->queued_len,xfer->total_len ,to_recv_size,xfer_size);
+	ESP_EARLY_LOGI("tu", "OUT%d rcv may ovf:%d %d (%d xfer:%d)--------bug\n",epnum,xfer->queued_len,xfer->total_len ,to_recv_size,xfer_size);
 	goto out;
   	}
 
@@ -578,42 +600,18 @@ static IRAM_ATTR int transmit_packet(xfer_ctl_t *xfer, volatile usb_in_endpoint_
   uint16_t remaining = (in_ep->dieptsiz & 0x7FFFFU) >> USB_D_XFERSIZE0_S;
 
   if(1 != xfer->tx_fsm  && 0!=fifo_num){
-	  MY_IN_ERROR_EARLY_LOGI("tu", "###bug fsm IN%d r%d %d %d\n",fifo_num, remaining,xfer->queued_len,xfer->total_len);
+	  ESP_EARLY_LOGI("tu", "###bug fsm IN%d r%d %d %d\n",fifo_num, remaining,xfer->queued_len,xfer->total_len);
     
   }
   	  
 
-#if 0
-  if(0==fifo_num) {
-  	xfer->queued_len = xfer->total_len - remaining;
-  }
- #endif 
-#if 0
-  uint16_t to_xfer_size =0;
- if(0!=fifo_num){
-	to_xfer_size=((remaining-xfer->queued_len) > xfer->max_size) ? xfer->max_size: (remaining-xfer->queued_len);
-	
- }
- else{
-
-	to_xfer_size = (remaining > xfer->max_size) ? xfer->max_size : remaining;
-
- 	}
-#else
-
   uint16_t to_xfer_size = (remaining > xfer->max_size) ? xfer->max_size : remaining;
 
  
-#endif
+
   uint8_t to_xfer_rem = to_xfer_size % 4;
   uint16_t to_xfer_size_aligned = to_xfer_size - to_xfer_rem;
 
-#if 0
-  if(0!=fifo_num){
-  	if(to_xfer_size==xfer->max_size)
-		to_xfer_size-=4;//ok we just test it
-  	}
-#endif
   // Buffer might not be aligned to 32b, so we need to force alignment
   // by copying to a temp var.
   uint8_t *base = (xfer->buffer + xfer->queued_len);
@@ -766,14 +764,7 @@ static void IRAM_ATTR handle_epin_ints(void)
 	   USB0.in_ep_reg[n].dieptsiz =  0;
 	   
 			if((xfer->queued_len >= xfer->total_len)){
-				long diff=get_system_us()- xfer->start_us;
-				long spd=(xfer->total_len*1000)/diff;
-				tx_speed=spd;
-				#if 1
-				 MY_IN_DBG_EARLY_LOGI("tu", "#IN%d xfer cpl irq%x xfs:%x ctl%x siz%x t:%d spd%d\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz,diff,spd);
-		  		#else
-				ESP_EARLY_LOGI("tu", "#IN%d xfer cpl irq%x xfs:%x ctl%x siz%x t:%d spd%d\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz,diff,spd);
-				#endif
+	
 				xfer->tx_fsm=2;	
 				xfer->nak_cnt=0;
         		dcd_event_xfer_complete(0, n | TUSB_DIR_IN_MASK, xfer->total_len, XFER_RESULT_SUCCESS, true);
@@ -798,8 +789,8 @@ static void IRAM_ATTR handle_epin_ints(void)
 	  	int tx_n=0;
         ESP_EARLY_LOGV(TAG, "TUSB IRQ - IN XFER FIFO empty!");
 		 if(0 != n) {
-      // MY_IN_DBG_EARLY_LOGI("tu", "IN%d irq%x %x\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts);
-	   //MY_IN_DBG_EARLY_LOGI("tu", "IN%d ctl%x %x\n",n,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz);
+      // ESP_EARLY_LOGI("tu", "IN%d irq%x %x\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts);
+	   //ESP_EARLY_LOGI("tu", "IN%d ctl%x %x\n",n,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz);
       	}
         USB0.in_ep_reg[n].diepint = USB_D_TXFEMP0_M;
 		if( 0==n) 
@@ -823,10 +814,10 @@ static void IRAM_ATTR handle_epin_ints(void)
 	  if (USB0.in_ep_reg[n].diepint & USB_D_INTKNTXFEMP0 && (USB0.in_ep_reg[n].diepint & USB_D_NAKINTRPT0_M)) {
 		USB0.in_ep_reg[n].diepint = USB_D_INTKNTXFEMP0|USB_D_NAKINTRPT0_M;
 		 xfer->nak_cnt++;
-		if(USB0.in_ep_reg[n].diepctl & USB_D_EPENA1_M && 0!=n &&  xfer->nak_cnt >=g_nak_thd){
+		if(USB0.in_ep_reg[n].diepctl & USB_D_EPENA1_M && 0!=n &&  xfer->nak_cnt >=2){
 				transmit_packet(xfer, &USB0.in_ep_reg[n], n);
 				USB0.dtknqr4_fifoemptymsk &= ~(1 << n);
-				  MY_IN_DBG_EARLY_LOGI("tu", "IN%d wt fifo irq%x xfs%x ctl%x siz%x\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz);
+				  ESP_EARLY_LOGI("tu", "IN%d wt fifo irq%x xfs%x ctl%x siz%x\n",n,USB0.in_ep_reg[n].diepint,USB0.in_ep_reg[n].dtxfsts,USB0.in_ep_reg[n].diepctl,USB0.in_ep_reg[n].dieptsiz);
 			}
 	  	}
 #endif
