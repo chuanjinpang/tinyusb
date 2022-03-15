@@ -182,7 +182,7 @@ size_t _tud_vendor_submit_tx_urb (uint8_t itf, urb_msg_t * msg)
 
   vendord_interface_t* p_itf = &_vendord_itf[itf];
 
-  if(pdTRUE!= xQueueSend(p_itf->urb_list, msg, (80) / portTICK_RATE_MS))
+  if(pdTRUE!= xQueueSend(p_itf->urb_list, msg, (100) / portTICK_RATE_MS))
     {
 		  ret=0;
 		  goto out;
